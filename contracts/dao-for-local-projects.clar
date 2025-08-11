@@ -8,6 +8,8 @@
 (define-constant ERR_VOTING_ACTIVE (err u405))
 (define-constant ERR_ALREADY_VOTED (err u406))
 (define-constant ERR_NOT_MEMBER (err u407))
+(define-constant ERR_CANNOT_DELEGATE_TO_SELF (err u408))
+(define-constant ERR_ALREADY_DELEGATED (err u409))
 
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-member-id uint u1)
@@ -21,7 +23,9 @@
     address: principal,
     joined-at: uint,
     voting-power: uint,
-    is-active: bool
+    is-active: bool,
+    delegated-to: (optional principal),
+    delegated-power: uint
   }
 )
 
@@ -79,7 +83,9 @@
         address: caller,
         joined-at: stacks-block-height,
         voting-power: u1,
-        is-active: true
+        is-active: true,
+        delegated-to: none,
+        delegated-power: u0
       }
     )
     
@@ -132,7 +138,9 @@
       (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_NOT_FOUND))
       (member-data (unwrap! (map-get? member-by-address { address: caller }) ERR_NOT_MEMBER))
       (member-info (unwrap! (map-get? members { member-id: (get member-id member-data) }) ERR_NOT_FOUND))
-      (voting-power (get voting-power member-info))
+      (base-power (get voting-power member-info))
+      (delegated-power (get delegated-power member-info))
+      (voting-power (+ base-power delegated-power))
     )
     (asserts! (get is-active member-info) ERR_NOT_AUTHORIZED)
     (asserts! (<= stacks-block-height (get voting-ends-at proposal)) ERR_VOTING_ENDED)
@@ -246,6 +254,62 @@
   )
 )
 
+(define-public (delegate-voting-power (delegate-to principal))
+  (let 
+    (
+      (caller tx-sender)
+      (delegator-data (unwrap! (map-get? member-by-address { address: caller }) ERR_NOT_MEMBER))
+      (delegator-info (unwrap! (map-get? members { member-id: (get member-id delegator-data) }) ERR_NOT_FOUND))
+      (delegate-data (unwrap! (map-get? member-by-address { address: delegate-to }) ERR_NOT_MEMBER))
+      (delegate-info (unwrap! (map-get? members { member-id: (get member-id delegate-data) }) ERR_NOT_FOUND))
+      (delegator-power (get voting-power delegator-info))
+    )
+    (asserts! (not (is-eq caller delegate-to)) ERR_CANNOT_DELEGATE_TO_SELF)
+    (asserts! (get is-active delegator-info) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active delegate-info) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none (get delegated-to delegator-info)) ERR_ALREADY_DELEGATED)
+    
+    (map-set members
+      { member-id: (get member-id delegator-data) }
+      (merge delegator-info { delegated-to: (some delegate-to) })
+    )
+    
+    (map-set members
+      { member-id: (get member-id delegate-data) }
+      (merge delegate-info { delegated-power: (+ (get delegated-power delegate-info) delegator-power) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (revoke-delegation)
+  (let 
+    (
+      (caller tx-sender)
+      (delegator-data (unwrap! (map-get? member-by-address { address: caller }) ERR_NOT_MEMBER))
+      (delegator-info (unwrap! (map-get? members { member-id: (get member-id delegator-data) }) ERR_NOT_FOUND))
+      (delegate-address (unwrap! (get delegated-to delegator-info) ERR_NOT_FOUND))
+      (delegate-data (unwrap! (map-get? member-by-address { address: delegate-address }) ERR_NOT_MEMBER))
+      (delegate-info (unwrap! (map-get? members { member-id: (get member-id delegate-data) }) ERR_NOT_FOUND))
+      (delegator-power (get voting-power delegator-info))
+    )
+    (asserts! (get is-active delegator-info) ERR_NOT_AUTHORIZED)
+    
+    (map-set members
+      { member-id: (get member-id delegator-data) }
+      (merge delegator-info { delegated-to: none })
+    )
+    
+    (map-set members
+      { member-id: (get member-id delegate-data) }
+      (merge delegate-info { delegated-power: (- (get delegated-power delegate-info) delegator-power) })
+    )
+    
+    (ok true)
+  )
+)
+
 (define-read-only (get-member (member-id uint))
   (map-get? members { member-id: member-id })
 )
@@ -284,4 +348,44 @@
 
 (define-read-only (get-next-member-id)
   (var-get next-member-id)
+)
+
+(define-read-only (get-delegation-info (address principal))
+  (let 
+    (
+      (member-data (map-get? member-by-address { address: address }))
+    )
+    (match member-data
+      member-info
+        (let ((member-details (map-get? members { member-id: (get member-id member-info) })))
+          (match member-details
+            details (some { 
+              delegated-to: (get delegated-to details),
+              delegated-power: (get delegated-power details),
+              effective-voting-power: (+ (get voting-power details) (get delegated-power details))
+            })
+            none
+          )
+        )
+      none
+    )
+  )
+)
+
+(define-read-only (get-effective-voting-power (address principal))
+  (let 
+    (
+      (member-data (map-get? member-by-address { address: address }))
+    )
+    (match member-data
+      member-info
+        (let ((member-details (map-get? members { member-id: (get member-id member-info) })))
+          (match member-details
+            details (some (+ (get voting-power details) (get delegated-power details)))
+            none
+          )
+        )
+      none
+    )
+  )
 )
