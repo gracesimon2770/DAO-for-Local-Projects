@@ -10,8 +10,12 @@
 (define-constant ERR_NOT_MEMBER (err u407))
 (define-constant ERR_CANNOT_DELEGATE_TO_SELF (err u408))
 (define-constant ERR_ALREADY_DELEGATED (err u409))
+(define-constant ERR_MILESTONE_NOT_FOUND (err u410))
+(define-constant ERR_MILESTONE_ALREADY_COMPLETED (err u411))
+(define-constant ERR_INSUFFICIENT_MILESTONE_VOTES (err u412))
 
 (define-data-var next-proposal-id uint u1)
+(define-data-var next-milestone-id uint u1)
 (define-data-var next-member-id uint u1)
 (define-data-var treasury-balance uint u0)
 (define-data-var voting-period uint u1440)
@@ -67,6 +71,30 @@
 (define-map proposal-update-count
   { proposal-id: uint }
   { count: uint }
+)
+
+(define-map milestones
+  { milestone-id: uint }
+  {
+    proposal-id: uint,
+    title: (string-ascii 100),
+    description: (string-ascii 300),
+    funding-amount: uint,
+    completion-votes: uint,
+    required-votes: uint,
+    completed: bool,
+    created-at: uint
+  }
+)
+
+(define-map milestone-completion-votes
+  { milestone-id: uint, voter: principal }
+  { voted: bool }
+)
+
+(define-map proposal-milestones
+  { proposal-id: uint }
+  { milestone-count: uint, completed-count: uint, total-funding: uint }
 )
 
 (define-public (join-dao)
@@ -310,6 +338,108 @@
   )
 )
 
+(define-public (create-milestone (proposal-id uint) (title (string-ascii 100)) (description (string-ascii 300)) (funding-amount uint))
+  (let 
+    (
+      (caller tx-sender)
+      (milestone-id (var-get next-milestone-id))
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_NOT_FOUND))
+      (required-votes (var-get min-votes-required))
+    )
+    (asserts! (is-eq caller (get proposer proposal)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status proposal) "approved") ERR_NOT_AUTHORIZED)
+    (asserts! (> funding-amount u0) ERR_INVALID_AMOUNT)
+    
+    (map-set milestones
+      { milestone-id: milestone-id }
+      {
+        proposal-id: proposal-id,
+        title: title,
+        description: description,
+        funding-amount: funding-amount,
+        completion-votes: u0,
+        required-votes: required-votes,
+        completed: false,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (let ((milestone-info (default-to { milestone-count: u0, completed-count: u0, total-funding: u0 } 
+                                      (map-get? proposal-milestones { proposal-id: proposal-id }))))
+      (map-set proposal-milestones
+        { proposal-id: proposal-id }
+        {
+          milestone-count: (+ (get milestone-count milestone-info) u1),
+          completed-count: (get completed-count milestone-info),
+          total-funding: (+ (get total-funding milestone-info) funding-amount)
+        }
+      )
+    )
+    
+    (var-set next-milestone-id (+ milestone-id u1))
+    (ok milestone-id)
+  )
+)
+
+(define-public (vote-milestone-completion (milestone-id uint))
+  (let 
+    (
+      (caller tx-sender)
+      (milestone (unwrap! (map-get? milestones { milestone-id: milestone-id }) ERR_MILESTONE_NOT_FOUND))
+      (member-data (unwrap! (map-get? member-by-address { address: caller }) ERR_NOT_MEMBER))
+      (member-info (unwrap! (map-get? members { member-id: (get member-id member-data) }) ERR_NOT_FOUND))
+    )
+    (asserts! (get is-active member-info) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get completed milestone)) ERR_MILESTONE_ALREADY_COMPLETED)
+    (asserts! (is-none (map-get? milestone-completion-votes { milestone-id: milestone-id, voter: caller })) ERR_ALREADY_VOTED)
+    
+    (map-set milestone-completion-votes
+      { milestone-id: milestone-id, voter: caller }
+      { voted: true }
+    )
+    
+    (let ((new-votes (+ (get completion-votes milestone) u1)))
+      (map-set milestones
+        { milestone-id: milestone-id }
+        (merge milestone { completion-votes: new-votes })
+      )
+      
+      (if (>= new-votes (get required-votes milestone))
+        (complete-milestone-funding milestone-id)
+        (ok false)
+      )
+    )
+  )
+)
+
+(define-private (complete-milestone-funding (milestone-id uint))
+  (let 
+    (
+      (milestone (unwrap! (map-get? milestones { milestone-id: milestone-id }) ERR_MILESTONE_NOT_FOUND))
+      (proposal (unwrap! (map-get? proposals { proposal-id: (get proposal-id milestone) }) ERR_NOT_FOUND))
+      (funding-amount (get funding-amount milestone))
+    )
+    (asserts! (>= (var-get treasury-balance) funding-amount) ERR_INSUFFICIENT_FUNDS)
+    
+    (var-set treasury-balance (- (var-get treasury-balance) funding-amount))
+    (try! (as-contract (stx-transfer? funding-amount tx-sender (get proposer proposal))))
+    
+    (map-set milestones
+      { milestone-id: milestone-id }
+      (merge milestone { completed: true })
+    )
+    
+    (let ((milestone-info (unwrap! (map-get? proposal-milestones { proposal-id: (get proposal-id milestone) }) ERR_NOT_FOUND)))
+      (map-set proposal-milestones
+        { proposal-id: (get proposal-id milestone) }
+        (merge milestone-info { completed-count: (+ (get completed-count milestone-info) u1) })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
 (define-read-only (get-member (member-id uint))
   (map-get? members { member-id: member-id })
 )
@@ -388,4 +518,20 @@
       none
     )
   )
+)
+
+(define-read-only (get-milestone (milestone-id uint))
+  (map-get? milestones { milestone-id: milestone-id })
+)
+
+(define-read-only (get-proposal-milestone-info (proposal-id uint))
+  (map-get? proposal-milestones { proposal-id: proposal-id })
+)
+
+(define-read-only (get-milestone-completion-vote (milestone-id uint) (voter principal))
+  (map-get? milestone-completion-votes { milestone-id: milestone-id, voter: voter })
+)
+
+(define-read-only (get-next-milestone-id)
+  (var-get next-milestone-id)
 )
