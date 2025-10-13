@@ -20,6 +20,7 @@
 (define-data-var treasury-balance uint u0)
 (define-data-var voting-period uint u1440)
 (define-data-var min-votes-required uint u3)
+(define-data-var reputation-enabled bool true)
 
 (define-map members 
   { member-id: uint }
@@ -97,6 +98,18 @@
   { milestone-count: uint, completed-count: uint, total-funding: uint }
 )
 
+(define-map member-reputation
+  { address: principal }
+  {
+    reputation-score: uint,
+    proposals-created: uint,
+    proposals-approved: uint,
+    votes-cast: uint,
+    milestones-completed: uint,
+    last-updated: uint
+  }
+)
+
 (define-public (join-dao)
   (let 
     (
@@ -120,6 +133,18 @@
     (map-set member-by-address
       { address: caller }
       { member-id: member-id }
+    )
+    
+    (map-set member-reputation
+      { address: caller }
+      {
+        reputation-score: u0,
+        proposals-created: u0,
+        proposals-approved: u0,
+        votes-cast: u0,
+        milestones-completed: u0,
+        last-updated: stacks-block-height
+      }
     )
     
     (var-set next-member-id (+ member-id u1))
@@ -153,6 +178,8 @@
         executed: false
       }
     )
+    
+    (unwrap! (award-reputation-for-proposal caller) (ok proposal-id))
     
     (var-set next-proposal-id (+ proposal-id u1))
     (ok proposal-id)
@@ -190,6 +217,8 @@
       )
     )
     
+    (unwrap! (award-reputation-for-voting caller) (ok true))
+    
     (ok true)
   )
 )
@@ -213,6 +242,7 @@
           { proposal-id: proposal-id }
           (merge proposal { status: "approved", executed: true })
         )
+        (unwrap! (award-reputation-for-approval (get proposer proposal)) (ok "approved"))
         (ok "approved")
       )
       (begin
@@ -412,6 +442,102 @@
   )
 )
 
+(define-private (award-reputation-for-proposal (member principal))
+  (let 
+    (
+      (rep-data (default-to 
+        { reputation-score: u0, proposals-created: u0, proposals-approved: u0, votes-cast: u0, milestones-completed: u0, last-updated: u0 }
+        (map-get? member-reputation { address: member })))
+    )
+    (if (var-get reputation-enabled)
+      (begin
+        (map-set member-reputation
+          { address: member }
+          (merge rep-data { 
+            proposals-created: (+ (get proposals-created rep-data) u1),
+            reputation-score: (+ (get reputation-score rep-data) u5),
+            last-updated: stacks-block-height
+          })
+        )
+        (ok true)
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-private (award-reputation-for-approval (member principal))
+  (let 
+    (
+      (rep-data (default-to 
+        { reputation-score: u0, proposals-created: u0, proposals-approved: u0, votes-cast: u0, milestones-completed: u0, last-updated: u0 }
+        (map-get? member-reputation { address: member })))
+    )
+    (if (var-get reputation-enabled)
+      (begin
+        (map-set member-reputation
+          { address: member }
+          (merge rep-data { 
+            proposals-approved: (+ (get proposals-approved rep-data) u1),
+            reputation-score: (+ (get reputation-score rep-data) u20),
+            last-updated: stacks-block-height
+          })
+        )
+        (ok true)
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-private (award-reputation-for-voting (member principal))
+  (let 
+    (
+      (rep-data (default-to 
+        { reputation-score: u0, proposals-created: u0, proposals-approved: u0, votes-cast: u0, milestones-completed: u0, last-updated: u0 }
+        (map-get? member-reputation { address: member })))
+    )
+    (if (var-get reputation-enabled)
+      (begin
+        (map-set member-reputation
+          { address: member }
+          (merge rep-data { 
+            votes-cast: (+ (get votes-cast rep-data) u1),
+            reputation-score: (+ (get reputation-score rep-data) u1),
+            last-updated: stacks-block-height
+          })
+        )
+        (ok true)
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-private (award-reputation-for-milestone (member principal))
+  (let 
+    (
+      (rep-data (default-to 
+        { reputation-score: u0, proposals-created: u0, proposals-approved: u0, votes-cast: u0, milestones-completed: u0, last-updated: u0 }
+        (map-get? member-reputation { address: member })))
+    )
+    (if (var-get reputation-enabled)
+      (begin
+        (map-set member-reputation
+          { address: member }
+          (merge rep-data { 
+            milestones-completed: (+ (get milestones-completed rep-data) u1),
+            reputation-score: (+ (get reputation-score rep-data) u15),
+            last-updated: stacks-block-height
+          })
+        )
+        (ok true)
+      )
+      (ok true)
+    )
+  )
+)
+
 (define-private (complete-milestone-funding (milestone-id uint))
   (let 
     (
@@ -435,6 +561,8 @@
         (merge milestone-info { completed-count: (+ (get completed-count milestone-info) u1) })
       )
     )
+    
+    (unwrap! (award-reputation-for-milestone (get proposer proposal)) (ok true))
     
     (ok true)
   )
@@ -534,4 +662,19 @@
 
 (define-read-only (get-next-milestone-id)
   (var-get next-milestone-id)
+)
+
+(define-read-only (get-member-reputation (address principal))
+  (map-get? member-reputation { address: address })
+)
+
+(define-read-only (get-reputation-score (address principal))
+  (match (map-get? member-reputation { address: address })
+    rep-data (some (get reputation-score rep-data))
+    none
+  )
+)
+
+(define-read-only (is-reputation-enabled)
+  (var-get reputation-enabled)
 )
