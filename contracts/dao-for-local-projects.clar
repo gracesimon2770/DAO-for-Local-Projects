@@ -13,6 +13,7 @@
 (define-constant ERR_MILESTONE_NOT_FOUND (err u410))
 (define-constant ERR_MILESTONE_ALREADY_COMPLETED (err u411))
 (define-constant ERR_INSUFFICIENT_MILESTONE_VOTES (err u412))
+(define-constant ERR_PAUSED (err u413))
 
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-milestone-id uint u1)
@@ -21,6 +22,7 @@
 (define-data-var voting-period uint u1440)
 (define-data-var min-votes-required uint u3)
 (define-data-var reputation-enabled bool true)
+(define-data-var contract-paused bool false)
 
 (define-map members 
   { member-id: uint }
@@ -111,186 +113,204 @@
 )
 
 (define-public (join-dao)
-  (let 
-    (
-      (caller tx-sender)
-      (member-id (var-get next-member-id))
+  (begin
+    (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+    (let 
+      (
+        (caller tx-sender)
+        (member-id (var-get next-member-id))
+      )
+      (asserts! (is-none (map-get? member-by-address { address: caller })) ERR_ALREADY_EXISTS)
+      
+      (map-set members 
+        { member-id: member-id }
+        {
+          address: caller,
+          joined-at: stacks-block-height,
+          voting-power: u1,
+          is-active: true,
+          delegated-to: none,
+          delegated-power: u0
+        }
+      )
+      
+      (map-set member-by-address
+        { address: caller }
+        { member-id: member-id }
+      )
+      
+      (map-set member-reputation
+        { address: caller }
+        {
+          reputation-score: u0,
+          proposals-created: u0,
+          proposals-approved: u0,
+          votes-cast: u0,
+          milestones-completed: u0,
+          last-updated: stacks-block-height
+        }
+      )
+      
+      (var-set next-member-id (+ member-id u1))
+      (ok member-id)
     )
-    (asserts! (is-none (map-get? member-by-address { address: caller })) ERR_ALREADY_EXISTS)
-    
-    (map-set members 
-      { member-id: member-id }
-      {
-        address: caller,
-        joined-at: stacks-block-height,
-        voting-power: u1,
-        is-active: true,
-        delegated-to: none,
-        delegated-power: u0
-      }
-    )
-    
-    (map-set member-by-address
-      { address: caller }
-      { member-id: member-id }
-    )
-    
-    (map-set member-reputation
-      { address: caller }
-      {
-        reputation-score: u0,
-        proposals-created: u0,
-        proposals-approved: u0,
-        votes-cast: u0,
-        milestones-completed: u0,
-        last-updated: stacks-block-height
-      }
-    )
-    
-    (var-set next-member-id (+ member-id u1))
-    (ok member-id)
   )
 )
 
 (define-public (propose-project (title (string-ascii 100)) (description (string-ascii 500)) (funding-amount uint))
-  (let 
-    (
-      (caller tx-sender)
-      (proposal-id (var-get next-proposal-id))
-      (member-data (map-get? member-by-address { address: caller }))
+  (begin
+    (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+    (let 
+      (
+        (caller tx-sender)
+        (proposal-id (var-get next-proposal-id))
+        (member-data (map-get? member-by-address { address: caller }))
+      )
+      (asserts! (is-some member-data) ERR_NOT_MEMBER)
+      (asserts! (> funding-amount u0) ERR_INVALID_AMOUNT)
+      (asserts! (<= funding-amount (var-get treasury-balance)) ERR_INSUFFICIENT_FUNDS)
+      
+      (map-set proposals
+        { proposal-id: proposal-id }
+        {
+          title: title,
+          description: description,
+          proposer: caller,
+          funding-amount: funding-amount,
+          created-at: stacks-block-height,
+          voting-ends-at: (+ stacks-block-height (var-get voting-period)),
+          votes-for: u0,
+          votes-against: u0,
+          status: "active",
+          executed: false
+        }
+      )
+      
+      (unwrap! (award-reputation-for-proposal caller) (ok proposal-id))
+      
+      (var-set next-proposal-id (+ proposal-id u1))
+      (ok proposal-id)
     )
-    (asserts! (is-some member-data) ERR_NOT_MEMBER)
-    (asserts! (> funding-amount u0) ERR_INVALID_AMOUNT)
-    (asserts! (<= funding-amount (var-get treasury-balance)) ERR_INSUFFICIENT_FUNDS)
-    
-    (map-set proposals
-      { proposal-id: proposal-id }
-      {
-        title: title,
-        description: description,
-        proposer: caller,
-        funding-amount: funding-amount,
-        created-at: stacks-block-height,
-        voting-ends-at: (+ stacks-block-height (var-get voting-period)),
-        votes-for: u0,
-        votes-against: u0,
-        status: "active",
-        executed: false
-      }
-    )
-    
-    (unwrap! (award-reputation-for-proposal caller) (ok proposal-id))
-    
-    (var-set next-proposal-id (+ proposal-id u1))
-    (ok proposal-id)
   )
 )
 
 (define-public (vote-on-proposal (proposal-id uint) (vote-for bool))
-  (let 
-    (
-      (caller tx-sender)
-      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_NOT_FOUND))
-      (member-data (unwrap! (map-get? member-by-address { address: caller }) ERR_NOT_MEMBER))
-      (member-info (unwrap! (map-get? members { member-id: (get member-id member-data) }) ERR_NOT_FOUND))
-      (base-power (get voting-power member-info))
-      (delegated-power (get delegated-power member-info))
-      (voting-power (+ base-power delegated-power))
-    )
-    (asserts! (get is-active member-info) ERR_NOT_AUTHORIZED)
-    (asserts! (<= stacks-block-height (get voting-ends-at proposal)) ERR_VOTING_ENDED)
-    (asserts! (is-none (map-get? votes { proposal-id: proposal-id, voter: caller })) ERR_ALREADY_VOTED)
-    
-    (map-set votes
-      { proposal-id: proposal-id, voter: caller }
-      { vote: vote-for, voting-power: voting-power }
-    )
-    
-    (if vote-for
-      (map-set proposals
-        { proposal-id: proposal-id }
-        (merge proposal { votes-for: (+ (get votes-for proposal) voting-power) })
+  (begin
+    (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+    (let 
+      (
+        (caller tx-sender)
+        (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_NOT_FOUND))
+        (member-data (unwrap! (map-get? member-by-address { address: caller }) ERR_NOT_MEMBER))
+        (member-info (unwrap! (map-get? members { member-id: (get member-id member-data) }) ERR_NOT_FOUND))
+        (base-power (get voting-power member-info))
+        (delegated-power (get delegated-power member-info))
+        (voting-power (+ base-power delegated-power))
       )
-      (map-set proposals
-        { proposal-id: proposal-id }
-        (merge proposal { votes-against: (+ (get votes-against proposal) voting-power) })
+      (asserts! (get is-active member-info) ERR_NOT_AUTHORIZED)
+      (asserts! (<= stacks-block-height (get voting-ends-at proposal)) ERR_VOTING_ENDED)
+      (asserts! (is-none (map-get? votes { proposal-id: proposal-id, voter: caller })) ERR_ALREADY_VOTED)
+      
+      (map-set votes
+        { proposal-id: proposal-id, voter: caller }
+        { vote: vote-for, voting-power: voting-power }
       )
+      
+      (if vote-for
+        (map-set proposals
+          { proposal-id: proposal-id }
+          (merge proposal { votes-for: (+ (get votes-for proposal) voting-power) })
+        )
+        (map-set proposals
+          { proposal-id: proposal-id }
+          (merge proposal { votes-against: (+ (get votes-against proposal) voting-power) })
+        )
+      )
+      
+      (unwrap! (award-reputation-for-voting caller) (ok true))
+      
+      (ok true)
     )
-    
-    (unwrap! (award-reputation-for-voting caller) (ok true))
-    
-    (ok true)
   )
 )
 
 (define-public (execute-proposal (proposal-id uint))
-  (let 
-    (
-      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_NOT_FOUND))
-      (total-votes (+ (get votes-for proposal) (get votes-against proposal)))
-    )
-    (asserts! (> stacks-block-height (get voting-ends-at proposal)) ERR_VOTING_ACTIVE)
-    (asserts! (not (get executed proposal)) ERR_ALREADY_EXISTS)
-    (asserts! (>= total-votes (var-get min-votes-required)) ERR_INVALID_AMOUNT)
-    
-    (if (> (get votes-for proposal) (get votes-against proposal))
-      (begin
-        (asserts! (>= (var-get treasury-balance) (get funding-amount proposal)) ERR_INSUFFICIENT_FUNDS)
-        (var-set treasury-balance (- (var-get treasury-balance) (get funding-amount proposal)))
-        (try! (as-contract (stx-transfer? (get funding-amount proposal) tx-sender (get proposer proposal))))
-        (map-set proposals
-          { proposal-id: proposal-id }
-          (merge proposal { status: "approved", executed: true })
-        )
-        (unwrap! (award-reputation-for-approval (get proposer proposal)) (ok "approved"))
-        (ok "approved")
+  (begin
+    (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+    (let 
+      (
+        (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_NOT_FOUND))
+        (total-votes (+ (get votes-for proposal) (get votes-against proposal)))
       )
-      (begin
-        (map-set proposals
-          { proposal-id: proposal-id }
-          (merge proposal { status: "rejected", executed: true })
+      (asserts! (> stacks-block-height (get voting-ends-at proposal)) ERR_VOTING_ACTIVE)
+      (asserts! (not (get executed proposal)) ERR_ALREADY_EXISTS)
+      (asserts! (>= total-votes (var-get min-votes-required)) ERR_INVALID_AMOUNT)
+      
+      (if (> (get votes-for proposal) (get votes-against proposal))
+        (begin
+          (asserts! (>= (var-get treasury-balance) (get funding-amount proposal)) ERR_INSUFFICIENT_FUNDS)
+          (var-set treasury-balance (- (var-get treasury-balance) (get funding-amount proposal)))
+          (try! (as-contract (stx-transfer? (get funding-amount proposal) tx-sender (get proposer proposal))))
+          (map-set proposals
+            { proposal-id: proposal-id }
+            (merge proposal { status: "approved", executed: true })
+          )
+          (unwrap! (award-reputation-for-approval (get proposer proposal)) (ok "approved"))
+          (ok "approved")
         )
-        (ok "rejected")
+        (begin
+          (map-set proposals
+            { proposal-id: proposal-id }
+            (merge proposal { status: "rejected", executed: true })
+          )
+          (ok "rejected")
+        )
       )
     )
   )
 )
 
 (define-public (add-project-update (proposal-id uint) (message (string-ascii 300)))
-  (let 
-    (
-      (caller tx-sender)
-      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_NOT_FOUND))
-      (current-count (default-to u0 (get count (map-get? proposal-update-count { proposal-id: proposal-id }))))
-      (update-id (+ current-count u1))
+  (begin
+    (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+    (let 
+      (
+        (caller tx-sender)
+        (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_NOT_FOUND))
+        (current-count (default-to u0 (get count (map-get? proposal-update-count { proposal-id: proposal-id }))))
+        (update-id (+ current-count u1))
+      )
+      (asserts! (is-eq caller (get proposer proposal)) ERR_NOT_AUTHORIZED)
+      (asserts! (is-eq (get status proposal) "approved") ERR_NOT_AUTHORIZED)
+      
+      (map-set project-updates
+        { proposal-id: proposal-id, update-id: update-id }
+        {
+          message: message,
+          timestamp: stacks-block-height,
+          reporter: caller
+        }
+      )
+      
+      (map-set proposal-update-count
+        { proposal-id: proposal-id }
+        { count: update-id }
+      )
+      
+      (ok update-id)
     )
-    (asserts! (is-eq caller (get proposer proposal)) ERR_NOT_AUTHORIZED)
-    (asserts! (is-eq (get status proposal) "approved") ERR_NOT_AUTHORIZED)
-    
-    (map-set project-updates
-      { proposal-id: proposal-id, update-id: update-id }
-      {
-        message: message,
-        timestamp: stacks-block-height,
-        reporter: caller
-      }
-    )
-    
-    (map-set proposal-update-count
-      { proposal-id: proposal-id }
-      { count: update-id }
-    )
-    
-    (ok update-id)
   )
 )
 
 (define-public (fund-treasury)
-  (let ((amount (stx-get-balance tx-sender)))
-    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
-    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
-    (var-set treasury-balance (+ (var-get treasury-balance) amount))
-    (ok amount)
+  (begin
+    (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+    (let ((amount (stx-get-balance tx-sender)))
+      (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+      (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+      (var-set treasury-balance (+ (var-get treasury-balance) amount))
+      (ok amount)
+    )
   )
 )
 
@@ -313,130 +333,142 @@
 )
 
 (define-public (delegate-voting-power (delegate-to principal))
-  (let 
-    (
-      (caller tx-sender)
-      (delegator-data (unwrap! (map-get? member-by-address { address: caller }) ERR_NOT_MEMBER))
-      (delegator-info (unwrap! (map-get? members { member-id: (get member-id delegator-data) }) ERR_NOT_FOUND))
-      (delegate-data (unwrap! (map-get? member-by-address { address: delegate-to }) ERR_NOT_MEMBER))
-      (delegate-info (unwrap! (map-get? members { member-id: (get member-id delegate-data) }) ERR_NOT_FOUND))
-      (delegator-power (get voting-power delegator-info))
+  (begin
+    (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+    (let 
+      (
+        (caller tx-sender)
+        (delegator-data (unwrap! (map-get? member-by-address { address: caller }) ERR_NOT_MEMBER))
+        (delegator-info (unwrap! (map-get? members { member-id: (get member-id delegator-data) }) ERR_NOT_FOUND))
+        (delegate-data (unwrap! (map-get? member-by-address { address: delegate-to }) ERR_NOT_MEMBER))
+        (delegate-info (unwrap! (map-get? members { member-id: (get member-id delegate-data) }) ERR_NOT_FOUND))
+        (delegator-power (get voting-power delegator-info))
+      )
+      (asserts! (not (is-eq caller delegate-to)) ERR_CANNOT_DELEGATE_TO_SELF)
+      (asserts! (get is-active delegator-info) ERR_NOT_AUTHORIZED)
+      (asserts! (get is-active delegate-info) ERR_NOT_AUTHORIZED)
+      (asserts! (is-none (get delegated-to delegator-info)) ERR_ALREADY_DELEGATED)
+      
+      (map-set members
+        { member-id: (get member-id delegator-data) }
+        (merge delegator-info { delegated-to: (some delegate-to) })
+      )
+      
+      (map-set members
+        { member-id: (get member-id delegate-data) }
+        (merge delegate-info { delegated-power: (+ (get delegated-power delegate-info) delegator-power) })
+      )
+      
+      (ok true)
     )
-    (asserts! (not (is-eq caller delegate-to)) ERR_CANNOT_DELEGATE_TO_SELF)
-    (asserts! (get is-active delegator-info) ERR_NOT_AUTHORIZED)
-    (asserts! (get is-active delegate-info) ERR_NOT_AUTHORIZED)
-    (asserts! (is-none (get delegated-to delegator-info)) ERR_ALREADY_DELEGATED)
-    
-    (map-set members
-      { member-id: (get member-id delegator-data) }
-      (merge delegator-info { delegated-to: (some delegate-to) })
-    )
-    
-    (map-set members
-      { member-id: (get member-id delegate-data) }
-      (merge delegate-info { delegated-power: (+ (get delegated-power delegate-info) delegator-power) })
-    )
-    
-    (ok true)
   )
 )
 
 (define-public (revoke-delegation)
-  (let 
-    (
-      (caller tx-sender)
-      (delegator-data (unwrap! (map-get? member-by-address { address: caller }) ERR_NOT_MEMBER))
-      (delegator-info (unwrap! (map-get? members { member-id: (get member-id delegator-data) }) ERR_NOT_FOUND))
-      (delegate-address (unwrap! (get delegated-to delegator-info) ERR_NOT_FOUND))
-      (delegate-data (unwrap! (map-get? member-by-address { address: delegate-address }) ERR_NOT_MEMBER))
-      (delegate-info (unwrap! (map-get? members { member-id: (get member-id delegate-data) }) ERR_NOT_FOUND))
-      (delegator-power (get voting-power delegator-info))
+  (begin
+    (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+    (let 
+      (
+        (caller tx-sender)
+        (delegator-data (unwrap! (map-get? member-by-address { address: caller }) ERR_NOT_MEMBER))
+        (delegator-info (unwrap! (map-get? members { member-id: (get member-id delegator-data) }) ERR_NOT_FOUND))
+        (delegate-address (unwrap! (get delegated-to delegator-info) ERR_NOT_FOUND))
+        (delegate-data (unwrap! (map-get? member-by-address { address: delegate-address }) ERR_NOT_MEMBER))
+        (delegate-info (unwrap! (map-get? members { member-id: (get member-id delegate-data) }) ERR_NOT_FOUND))
+        (delegator-power (get voting-power delegator-info))
+      )
+      (asserts! (get is-active delegator-info) ERR_NOT_AUTHORIZED)
+      
+      (map-set members
+        { member-id: (get member-id delegator-data) }
+        (merge delegator-info { delegated-to: none })
+      )
+      
+      (map-set members
+        { member-id: (get member-id delegate-data) }
+        (merge delegate-info { delegated-power: (- (get delegated-power delegate-info) delegator-power) })
+      )
+      
+      (ok true)
     )
-    (asserts! (get is-active delegator-info) ERR_NOT_AUTHORIZED)
-    
-    (map-set members
-      { member-id: (get member-id delegator-data) }
-      (merge delegator-info { delegated-to: none })
-    )
-    
-    (map-set members
-      { member-id: (get member-id delegate-data) }
-      (merge delegate-info { delegated-power: (- (get delegated-power delegate-info) delegator-power) })
-    )
-    
-    (ok true)
   )
 )
 
 (define-public (create-milestone (proposal-id uint) (title (string-ascii 100)) (description (string-ascii 300)) (funding-amount uint))
-  (let 
-    (
-      (caller tx-sender)
-      (milestone-id (var-get next-milestone-id))
-      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_NOT_FOUND))
-      (required-votes (var-get min-votes-required))
-    )
-    (asserts! (is-eq caller (get proposer proposal)) ERR_NOT_AUTHORIZED)
-    (asserts! (is-eq (get status proposal) "approved") ERR_NOT_AUTHORIZED)
-    (asserts! (> funding-amount u0) ERR_INVALID_AMOUNT)
-    
-    (map-set milestones
-      { milestone-id: milestone-id }
-      {
-        proposal-id: proposal-id,
-        title: title,
-        description: description,
-        funding-amount: funding-amount,
-        completion-votes: u0,
-        required-votes: required-votes,
-        completed: false,
-        created-at: stacks-block-height
-      }
-    )
-    
-    (let ((milestone-info (default-to { milestone-count: u0, completed-count: u0, total-funding: u0 } 
-                                      (map-get? proposal-milestones { proposal-id: proposal-id }))))
-      (map-set proposal-milestones
-        { proposal-id: proposal-id }
+  (begin
+    (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+    (let 
+      (
+        (caller tx-sender)
+        (milestone-id (var-get next-milestone-id))
+        (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR_NOT_FOUND))
+        (required-votes (var-get min-votes-required))
+      )
+      (asserts! (is-eq caller (get proposer proposal)) ERR_NOT_AUTHORIZED)
+      (asserts! (is-eq (get status proposal) "approved") ERR_NOT_AUTHORIZED)
+      (asserts! (> funding-amount u0) ERR_INVALID_AMOUNT)
+      
+      (map-set milestones
+        { milestone-id: milestone-id }
         {
-          milestone-count: (+ (get milestone-count milestone-info) u1),
-          completed-count: (get completed-count milestone-info),
-          total-funding: (+ (get total-funding milestone-info) funding-amount)
+          proposal-id: proposal-id,
+          title: title,
+          description: description,
+          funding-amount: funding-amount,
+          completion-votes: u0,
+          required-votes: required-votes,
+          completed: false,
+          created-at: stacks-block-height
         }
       )
+      
+      (let ((milestone-info (default-to { milestone-count: u0, completed-count: u0, total-funding: u0 } 
+                                        (map-get? proposal-milestones { proposal-id: proposal-id }))))
+        (map-set proposal-milestones
+          { proposal-id: proposal-id }
+          {
+            milestone-count: (+ (get milestone-count milestone-info) u1),
+            completed-count: (get completed-count milestone-info),
+            total-funding: (+ (get total-funding milestone-info) funding-amount)
+          }
+        )
+      )
+      
+      (var-set next-milestone-id (+ milestone-id u1))
+      (ok milestone-id)
     )
-    
-    (var-set next-milestone-id (+ milestone-id u1))
-    (ok milestone-id)
   )
 )
 
 (define-public (vote-milestone-completion (milestone-id uint))
-  (let 
-    (
-      (caller tx-sender)
-      (milestone (unwrap! (map-get? milestones { milestone-id: milestone-id }) ERR_MILESTONE_NOT_FOUND))
-      (member-data (unwrap! (map-get? member-by-address { address: caller }) ERR_NOT_MEMBER))
-      (member-info (unwrap! (map-get? members { member-id: (get member-id member-data) }) ERR_NOT_FOUND))
-    )
-    (asserts! (get is-active member-info) ERR_NOT_AUTHORIZED)
-    (asserts! (not (get completed milestone)) ERR_MILESTONE_ALREADY_COMPLETED)
-    (asserts! (is-none (map-get? milestone-completion-votes { milestone-id: milestone-id, voter: caller })) ERR_ALREADY_VOTED)
-    
-    (map-set milestone-completion-votes
-      { milestone-id: milestone-id, voter: caller }
-      { voted: true }
-    )
-    
-    (let ((new-votes (+ (get completion-votes milestone) u1)))
-      (map-set milestones
-        { milestone-id: milestone-id }
-        (merge milestone { completion-votes: new-votes })
+  (begin
+    (asserts! (not (var-get contract-paused)) ERR_PAUSED)
+    (let 
+      (
+        (caller tx-sender)
+        (milestone (unwrap! (map-get? milestones { milestone-id: milestone-id }) ERR_MILESTONE_NOT_FOUND))
+        (member-data (unwrap! (map-get? member-by-address { address: caller }) ERR_NOT_MEMBER))
+        (member-info (unwrap! (map-get? members { member-id: (get member-id member-data) }) ERR_NOT_FOUND))
+      )
+      (asserts! (get is-active member-info) ERR_NOT_AUTHORIZED)
+      (asserts! (not (get completed milestone)) ERR_MILESTONE_ALREADY_COMPLETED)
+      (asserts! (is-none (map-get? milestone-completion-votes { milestone-id: milestone-id, voter: caller })) ERR_ALREADY_VOTED)
+      
+      (map-set milestone-completion-votes
+        { milestone-id: milestone-id, voter: caller }
+        { voted: true }
       )
       
-      (if (>= new-votes (get required-votes milestone))
-        (complete-milestone-funding milestone-id)
-        (ok false)
+      (let ((new-votes (+ (get completion-votes milestone) u1)))
+        (map-set milestones
+          { milestone-id: milestone-id }
+          (merge milestone { completion-votes: new-votes })
+        )
+        
+        (if (>= new-votes (get required-votes milestone))
+          (complete-milestone-funding milestone-id)
+          (ok false)
+        )
       )
     )
   )
@@ -677,4 +709,24 @@
 
 (define-read-only (is-reputation-enabled)
   (var-get reputation-enabled)
+)
+
+(define-read-only (is-paused)
+  (var-get contract-paused)
+)
+
+(define-public (pause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set contract-paused true)
+    (ok true)
+  )
+)
+
+(define-public (resume-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set contract-paused false)
+    (ok true)
+  )
 )
