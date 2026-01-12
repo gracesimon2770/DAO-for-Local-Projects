@@ -24,6 +24,11 @@
 (define-data-var reputation-enabled bool true)
 (define-data-var contract-paused bool false)
 
+(define-map operators
+  { address: principal }
+  { active: bool }
+)
+
 (define-map members 
   { member-id: uint }
   { 
@@ -39,6 +44,42 @@
 (define-map member-by-address
   { address: principal }
   { member-id: uint }
+)
+
+(define-private (is-admin (caller principal))
+  (let 
+    (
+      (owner (is-eq caller CONTRACT_OWNER))
+      (op-data (map-get? operators { address: caller }))
+    )
+    (match op-data
+      data (or owner (get active data))
+      owner
+    )
+  )
+)
+
+(define-read-only (is-operator (address principal))
+  (match (map-get? operators { address: address })
+    data (get active data)
+    false
+  )
+)
+
+(define-public (grant-operator (address principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (map-set operators { address: address } { active: true })
+    (ok true)
+  )
+)
+
+(define-public (revoke-operator (address principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (map-set operators { address: address } { active: false })
+    (ok true)
+  )
 )
 
 (define-map proposals
@@ -316,19 +357,23 @@
 
 (define-public (set-voting-period (new-period uint))
   (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-    (asserts! (> new-period u0) ERR_INVALID_AMOUNT)
-    (var-set voting-period new-period)
-    (ok new-period)
+    (let ((caller tx-sender))
+      (asserts! (is-admin caller) ERR_NOT_AUTHORIZED)
+      (asserts! (> new-period u0) ERR_INVALID_AMOUNT)
+      (var-set voting-period new-period)
+      (ok new-period)
+    )
   )
 )
 
 (define-public (set-min-votes (min-votes uint))
   (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-    (asserts! (> min-votes u0) ERR_INVALID_AMOUNT)
-    (var-set min-votes-required min-votes)
-    (ok min-votes)
+    (let ((caller tx-sender))
+      (asserts! (is-admin caller) ERR_NOT_AUTHORIZED)
+      (asserts! (> min-votes u0) ERR_INVALID_AMOUNT)
+      (var-set min-votes-required min-votes)
+      (ok min-votes)
+    )
   )
 )
 
@@ -717,16 +762,20 @@
 
 (define-public (pause-contract)
   (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-    (var-set contract-paused true)
-    (ok true)
+    (let ((caller tx-sender))
+      (asserts! (is-admin caller) ERR_NOT_AUTHORIZED)
+      (var-set contract-paused true)
+      (ok true)
+    )
   )
 )
 
 (define-public (resume-contract)
   (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-    (var-set contract-paused false)
-    (ok true)
+    (let ((caller tx-sender))
+      (asserts! (is-admin caller) ERR_NOT_AUTHORIZED)
+      (var-set contract-paused false)
+      (ok true)
+    )
   )
 )
